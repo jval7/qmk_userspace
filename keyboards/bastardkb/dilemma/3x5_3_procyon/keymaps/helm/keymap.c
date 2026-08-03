@@ -147,14 +147,15 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 };
 // clang-format on
 
-#ifdef POINTING_DEVICE_ENABLE
-#    ifdef DILEMMA_AUTO_SNIPING_ON_LAYER
-layer_state_t layer_state_set_user(layer_state_t state) {
-    dilemma_set_pointer_sniping_enabled(layer_state_cmp(state, DILEMMA_AUTO_SNIPING_ON_LAYER));
-    return state;
-}
-#    endif // DILEMMA_AUTO_SNIPING_ON_LAYER
-#endif     // POINTING_DEVICE_ENABLE
+/* El hook layer_state_set_user vive ahora al FINAL de este fichero, fusionado
+ * con la publicación de la capa activa por Raw HID (mensaje 0xB4).
+ *
+ * No es un capricho de orden: layer_state_set_user solo puede definirse UNA vez
+ * en la unidad de compilación. Si el sniping automático se quedara aquí y la
+ * publicación de capa estuviera abajo, el enlazado fallaría con «multiple
+ * definition» en cuanto se descomentara DILEMMA_AUTO_SNIPING_ON_LAYER (línea 32
+ * de este fichero). La llamada a dilemma_set_pointer_sniping_enabled se
+ * conserva íntegra, con su #ifdef, dentro del hook fusionado. */
 
 #ifdef ENCODER_MAP_ENABLE
 // clang-format off
@@ -213,6 +214,7 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][NUM_DIRECTIONS] = {
  * (0x01-0x15 y 0xFF) y del prefijo 0x90 de Argos, que comparten endpoint. */
 #    define HELM_MSG_CONTACTS 0xB0 // conteo de dedos, solo por flanco
 #    define HELM_MSG_PESTILLO 0xB3 // estado del clic fijado
+#    define HELM_MSG_CAPA     0xB4 // capa activa más alta, solo por flanco
 
 /* Volcados de diagnóstico (0xB1 y 0xB2). Apagados: raw_hid_send puede bloquear
  * hasta 100 ms y esos mensajes salían desde dentro del bucle de escaneo, justo
@@ -265,6 +267,42 @@ static volatile uint32_t g_helm_ts_transicion = 0;     // último cambio del con
 static volatile uint32_t g_helm_ts_tres       = 0;     // instante en que se vieron 3
 static volatile uint32_t g_helm_ts_sin_dedos  = 0;     // instante del último despegue total
 static bool              g_helm_pestillo_pub  = false; // último estado publicado al host
+
+/* ---- Capa activa (mensaje 0xB4) ----------------------------------------
+ *
+ * El host dibuja las capas del teclado y necesita saber cuál está activa para
+ * cambiar el dibujo mientras se mantiene pulsada la tecla que la activa. Casi
+ * todas las capas de este keymap se alcanzan con LT(), o sea manteniendo, más
+ * la capa auto-mouse que se enciende sola al mover el trackpad.
+ *
+ * DOS VARIABLES Y NO UNA, igual que con el pestillo: una la escribe el hook de
+ * cambio de capa y la otra recuerda lo último que se mandó al host. La
+ * comparación entre ambas es lo que produce el flanco. Publicar en bucle está
+ * prohibido en este fichero por una razón medida: raw_hid_send termina en
+ * usb_endpoint_in_send con un timeout de 100 ms, así que un host que deje de
+ * drenar el endpoint congelaría el bucle principal.
+ *
+ * volatile es aquí una formalidad, no una necesidad: el hook de capa y
+ * housekeeping_task_user corren los dos en el hilo del bucle principal de QMK,
+ * no hay ISR de por medio. Se marca por coherencia con el resto del estado de
+ * este fichero y para que un futuro escritor desde interrupción no muerda. */
+static volatile uint8_t g_helm_capa     = 0;    // capa efectiva más alta ahora
+static uint8_t          g_helm_capa_pub = 0xFF; // 0xFF = nunca publicada aún
+
+/* El contrato con el host reserva UN byte para el índice, con rango 0..7. Hoy
+ * eso se cumple solo: VIA fija DYNAMIC_KEYMAP_LAYER_COUNT en 8, con lo que
+ * layer_state_t es uint8_t y get_highest_layer() no puede devolver más de 7.
+ * Si alguien sube el número de capas, esto revienta en compilación en vez de
+ * mandar un índice truncado que el host interpretaría como otra capa. */
+_Static_assert(MAX_LAYER <= 8, "El mensaje 0xB4 lleva la capa en un byte con rango 0..7");
+
+/* Anota la capa efectiva. Deliberadamente NO publica: esta función se llama
+ * desde el hook de cambio de capa, que corre en pleno camino de procesado de
+ * teclas; un raw_hid_send ahí puede costar hasta 100 ms y se sentiría como
+ * teclas perdidas. La publicación la hace housekeeping_task_user por flanco. */
+static inline void helm_anotar_capa(uint8_t capa) {
+    g_helm_capa = capa;
+}
 
 /* Suelta el botón de verdad, sin esperar al siguiente ciclo del task. Se usa en
  * los caminos de apagado y suspensión, donde no habrá siguiente ciclo. */
@@ -543,6 +581,20 @@ void housekeeping_task_user(void) {
         raw_hid_send(msg, sizeof(msg));
     }
 
+    /* Capa activa. Mismo criterio que los otros dos mensajes: SOLO por flanco.
+     * Si la capa cambia dos veces entre dos vueltas del bucle, el host recibe
+     * únicamente la última, que es lo correcto: le interesa el estado, no el
+     * historial. En el primer paso tras el arranque g_helm_capa_pub vale 0xFF,
+     * así que se publica la capa real una vez sin esperar a que cambie; si el
+     * USB todavía no está activo el envío retorna en el acto, sin bloquear. */
+    if (g_helm_capa != g_helm_capa_pub) {
+        g_helm_capa_pub = g_helm_capa;
+        uint8_t msg[32] = {0};
+        msg[0]          = HELM_MSG_CAPA;
+        msg[1]          = g_helm_capa;
+        raw_hid_send(msg, sizeof(msg)); // 32 bytes exactos: otra longitud se descarta en silencio
+    }
+
 #    if HELM_DIAG
     /* Latido cada 500 ms con el conteo y el estado crudo del sensor. */
     static uint32_t last_beat = 0;
@@ -561,3 +613,68 @@ void housekeeping_task_user(void) {
 #    endif
 }
 #endif
+
+/* ------------------------------------------------------------------------
+ * Hooks de cambio de capa.
+ *
+ * PUNTO DE ENGANCHE. layer_state_set_user es del keymap y está libre: el módulo
+ * bastardkb/bk_pointing_device engancha su ajuste de precisión en
+ * layer_state_set_bk_pointing_device, que cuelga de layer_state_set_modules,
+ * una cadena distinta de la de usuario (quantum/action_layer.c llama primero a
+ * los módulos, luego al teclado y este al usuario). Lo único que competía por
+ * este nombre era el bloque de sniping automático que vivía arriba en este
+ * mismo fichero, y por eso está fusionado aquí en lugar de duplicado.
+ *
+ * QUÉ ES «LA CAPA ACTIVA». get_highest_layer(layer_state | default_layer_state).
+ * El OR no es adorno: esa es exactamente la máscara con la que QMK resuelve qué
+ * keycode entrega una tecla en layer_switch_get_layer(), o sea la definición de
+ * capa efectiva del propio firmware. layer_state por sí solo ignora la capa por
+ * defecto; hoy esa es la 0 y daría igual, pero VIA está activo con 8 capas
+ * dinámicas y basta un DF() asignado desde la interfaz para que la base deje de
+ * ser la 0 y la señal empiece a mentir.
+ *
+ * Matiz asumido a propósito: get_highest_layer devuelve el bit más alto
+ * encendido, mientras que layer_switch_get_layer va bajando y se salta las capas
+ * cuya tecla concreta es transparente. Para dibujar la capa en pantalla queremos
+ * lo primero — qué capa está puesta —, no lo segundo, que depende de qué tecla
+ * se mire.
+ *
+ * NO SE ENVÍA DESDE AQUÍ. Este hook corre dentro del procesado de teclas y
+ * raw_hid_send puede bloquear hasta 100 ms. Solo se anota un byte; publica
+ * housekeeping_task_user, por flanco, como el resto de mensajes del fichero.
+ *
+ * La capa auto-mouse no necesita nada aparte: se enciende y apaga con
+ * layer_on/layer_off, que pasan por layer_state_set y disparan este mismo hook
+ * igual que un LT. En este keymap esa capa es la 4, LAYER_POINTER.
+ * ------------------------------------------------------------------------ */
+layer_state_t layer_state_set_user(layer_state_t state) {
+#ifdef POINTING_DEVICE_ENABLE
+#    ifdef DILEMMA_AUTO_SNIPING_ON_LAYER
+    dilemma_set_pointer_sniping_enabled(layer_state_cmp(state, DILEMMA_AUTO_SNIPING_ON_LAYER));
+#    endif // DILEMMA_AUTO_SNIPING_ON_LAYER
+#endif     // POINTING_DEVICE_ENABLE
+
+#ifdef RAW_ENABLE
+    /* Se lee el PARÁMETRO, no la global: layer_state_set asigna layer_state
+     * DESPUÉS de llamar a los hooks, así que aquí dentro la global todavía tiene
+     * el valor viejo. La capa por defecto sí se toma de su global, que esta
+     * transición no cambia. */
+    helm_anotar_capa(get_highest_layer(state | default_layer_state));
+#endif // RAW_ENABLE
+
+    return state;
+}
+
+/* Simétrico del anterior para la capa por defecto. Con el keymap tal cual está
+ * no se ejecuta nunca —no hay ningún DF() en las siete capas—, pero VIA permite
+ * reasignar teclas en caliente y un DF() puesto desde la interfaz cambiaría la
+ * base sin tocar layer_state, dejando la señal congelada en la capa anterior.
+ * Aquí el cruce es el inverso: la global es la de las capas momentáneas y el
+ * parámetro es la capa por defecto que entra en vigor. */
+layer_state_t default_layer_state_set_user(layer_state_t state) {
+#ifdef RAW_ENABLE
+    helm_anotar_capa(get_highest_layer(layer_state | state));
+#endif // RAW_ENABLE
+
+    return state;
+}
