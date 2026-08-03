@@ -1,0 +1,17 @@
+diff --git a/bk_pointing_device/bk_pointing_device.c b/bk_pointing_device/bk_pointing_device.c
+index a7212d9..fc469fa 100644
+--- a/bk_pointing_device/bk_pointing_device.c
++++ b/bk_pointing_device/bk_pointing_device.c
+@@ -544,6 +544,12 @@ bool digitizer_task_kb(digitizer_t *const digitizer_state) {
+ #endif
+         }
+     } 
++    // PARCHE LOCAL: reenviar al hook de usuario. QMK encadena kb -> user por
++    // convención, pero este módulo sobrescribe digitizer_task_kb y corta la
++    // cadena. Es el ÚNICO punto donde los contactos son válidos:
++    // digitizer_get_state() desde housekeeping devuelve siempre vacío.
++    digitizer_task_user(digitizer_state);
++
+     // trigger a button state changed in master
+     return true;
+ }
