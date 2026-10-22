@@ -426,9 +426,92 @@ bool digitizer_task_user(digitizer_t *const digitizer_state) {
  * ciclo no puede producir ráfagas: entra un desplazamiento por ciclo y sale
  * uno, siempre. Se prefiere un resto de rebote a un cursor impredecible.
  * ------------------------------------------------------------------------ */
+/* ---- Filtro contra el temblor del sensor --------------------------------
+ *
+ * El trackpad capta ruido de la red eléctrica cuando el chasis del Mac flota
+ * (basta tocarlo con la mano para que el temblor desaparezca: el cuerpo hace de
+ * camino a tierra). El arreglo bueno es eléctrico, pero se puede atenuar mucho
+ * aquí, y hay una razón física para que funcione: el ruido está en 50-60 Hz y
+ * el movimiento humano no pasa de ~10 Hz. Son separables POR FRECUENCIA, que es
+ * lo que hace inútil una zona muerta — el temblor y un movimiento lento tienen
+ * amplitudes parecidas, pero no ritmos parecidos.
+ *
+ * Paso bajo exponencial en coma fija. ALFA_MIN fija el corte con el dedo
+ * quieto: con este hook corriendo a 1 kHz, alfa/256 = 16/256 da unos 10 Hz,
+ * justo debajo del ruido y por encima de cualquier gesto.
+ *
+ * El corte se ABRE con la velocidad para no añadir retardo al mover: un paso
+ * bajo fijo a 10 Hz haría el puntero perezoso. La clave está en medir esa
+ * velocidad sobre la señal YA FILTRADA y no sobre la cruda: el ruido tiene
+ * media cero, así que al filtrarlo se cancela y en reposo la velocidad medida
+ * es casi nula. Con la señal cruda el propio temblor abriría el filtro que
+ * debía eliminarlo.
+ *
+ * DOS POLOS, no uno. Con un solo polo a 10 Hz el ruido de 50 Hz se atenúa unas
+ * cinco veces, y eso dejaba temblor visible. Encadenar un segundo polo lleva la
+ * atenuación a unas veinticinco, porque cada uno multiplica por su propia
+ * caída. Sale mucho más barato en retardo que bajar el corte a la mitad: el
+ * retardo crece de forma lineal con el número de polos, y la atenuación de
+ * forma geométrica. */
+#    define HELM_FILTRO_Q        8   // bits fraccionarios
+
+/* Escalado con redondeo SIMÉTRICO, y no es un detalle.
+ *
+ * El desplazamiento de bits redondea hacia menos infinito, también con
+ * negativos. En un filtro realimentado eso no se promedia: con entrada de media
+ * cero, un valor positivo pequeño recibe un -1 que debía ser -0.1, y uno
+ * negativo pequeño recibe un 0 que debía ser +0.1. El filtro se queda atascado
+ * en un negativo pequeño en vez de en cero, ese residuo constante entra en el
+ * acumulador de fracción y el puntero DERIVA solo hacia arriba y a la
+ * izquierda. Visto en hardware antes de encontrarlo aquí.
+ *
+ * Redondeando al entero más cercano y tratando igual los dos signos, los
+ * errores se reparten simétricos y una entrada de media cero vuelve a dar
+ * salida de media cero. */
+static inline int32_t helm_escala(int32_t valor, int32_t alfa) {
+    const int32_t medio   = 1 << (HELM_FILTRO_Q - 1);
+    const int32_t producto = valor * alfa;
+    return producto >= 0 ? (producto + medio) >> HELM_FILTRO_Q
+                         : -((-producto + medio) >> HELM_FILTRO_Q);
+}
+
+#    define HELM_FILTRO_ALFA_MIN 16  // dedo quieto: corte ~10 Hz
+#    define HELM_FILTRO_PEND     24  // cuánto abre el corte por unidad de velocidad
+
+/* ---- Compensación de deriva ---------------------------------------------
+ *
+ * Con el dedo apoyado y quieto, el sensor reporta un desplazamiento NETO
+ * sostenido: medido en este teclado, 72 px hacia arriba en diez segundos, casi
+ * todo en Y. No es temblor —el temblor tiene media cero y se cancela—, es una
+ * componente continua, y por eso el paso bajo de arriba no la toca: la deriva
+ * es baja frecuencia y atraviesa el filtro intacta. Suavizar más solo la hace
+ * más visible al quitarle el ruido que la disimulaba.
+ *
+ * Origen probable: el acoplamiento de red no es uniforme sobre la superficie
+ * del pad, así que el centroide que calcula el sensor se corre de forma
+ * sistemática hacia donde el ruido es mayor.
+ *
+ * Se corrige restando una media MUY lenta del propio desplazamiento, que es un
+ * bloqueador de continua. La clave es que esa media solo se actualiza CON EL
+ * DEDO EN REPOSO: si se dejara correr durante un movimiento real acabaría
+ * aprendiéndoselo y frenándolo, que es el fallo clásico de estos
+ * compensadores. */
+/* Media por BLOQUES, no media exponencial. El primer intento usaba una
+ * exponencial con alfa muy pequeña y no funcionó: la deriva medida es de 0.007
+ * px por ciclo, y el redondeo al entero más cercano descarta todo lo que no
+ * llegue a medio paso, así que la base no se movía nunca. Sumar un bloque
+ * entero y dividir al final no pierde nada, por pequeña que sea la señal. */
+#    define HELM_BASE_BLOQUE 512  // ciclos por bloque (~0,5 s a 1 kHz)
+
 report_mouse_t pointing_device_task_user(report_mouse_t report) {
     static mouse_xy_report_t pending_x = 0, pending_y = 0, out_x = 0, out_y = 0;
     static uint32_t          last_cycle = 0;
+    static int32_t           filtro_x = 0, filtro_y = 0;   // Q8, primer polo
+    static int32_t           filtro2_x = 0, filtro2_y = 0; // Q8, segundo polo
+    static int32_t           base_x = 0, base_y = 0;       // Q8, deriva aprendida en reposo
+    static int32_t           suma_x = 0, suma_y = 0;       // acumulador del bloque
+    static uint16_t          bloque = 0;                   // ciclos acumulados
+    static int32_t           resto_x = 0, resto_y = 0;     // Q8, fracción sin emitir
 
     /* PESTILLO — lo PRIMERO de todo, por delante de los retornos tempranos: el
      * caso que hay que sostener es justamente "cero contactos", porque el
@@ -455,6 +538,9 @@ report_mouse_t pointing_device_task_user(report_mouse_t report) {
      * cola aquí es idempotente, así que la doble invocación no molesta. */
     if (timer_elapsed32(g_helm_ts_transicion) < HELM_TRANSICION_MS) {
         pending_x = pending_y = out_x = out_y = 0;
+        filtro_x = filtro_y = filtro2_x = filtro2_y = base_x = base_y = resto_x = resto_y = 0;
+        suma_x = suma_y = 0;
+        bloque = 0;
         report.x = report.y = 0;
         report.h = report.v = 0;
         return report;
@@ -465,14 +551,21 @@ report_mouse_t pointing_device_task_user(report_mouse_t report) {
      * ahí tres contactos caen en la rama de la rueda. */
     if (g_helm_contacts >= 3) {
         pending_x = pending_y = out_x = out_y = 0;
+        filtro_x = filtro_y = filtro2_x = filtro2_y = base_x = base_y = resto_x = resto_y = 0;
+        suma_x = suma_y = 0;
+        bloque = 0;
         report.x = report.y = 0;
         report.h = report.v = 0;
         return report;
     }
 
     if (g_helm_contacts == 0) {
-        // Tirar lo retenido: es el salto del despegue.
+        // Tirar lo retenido: es el salto del despegue. El filtro también se
+        // reinicia, para que el gesto siguiente no arrastre la cola de este.
         pending_x = pending_y = out_x = out_y = 0;
+        filtro_x = filtro_y = filtro2_x = filtro2_y = base_x = base_y = resto_x = resto_y = 0;
+        suma_x = suma_y = 0;
+        bloque = 0;
         report.x = report.y = 0;
         return report;
     }
@@ -482,10 +575,48 @@ report_mouse_t pointing_device_task_user(report_mouse_t report) {
     const uint32_t now = timer_read32();
     if (now != last_cycle) {
         last_cycle = now;
+
+        /* Velocidad medida sobre lo YA filtrado: en reposo vale casi cero
+           porque el ruido se cancela, así que el filtro se queda cerrado. */
+        const int32_t vel  = (labs(filtro2_x) + labs(filtro2_y)) >> HELM_FILTRO_Q;
+        int32_t       alfa = HELM_FILTRO_ALFA_MIN + vel * HELM_FILTRO_PEND;
+        if (alfa > (1 << HELM_FILTRO_Q)) alfa = 1 << HELM_FILTRO_Q;
+
+        filtro_x += helm_escala(((int32_t)report.x << HELM_FILTRO_Q) - filtro_x, alfa);
+        filtro_y += helm_escala(((int32_t)report.y << HELM_FILTRO_Q) - filtro_y, alfa);
+        filtro2_x += helm_escala(filtro_x - filtro2_x, alfa);
+        filtro2_y += helm_escala(filtro_y - filtro2_y, alfa);
+
+        /* La línea base solo aprende con el dedo quieto. En cuanto hay
+           movimiento real se congela y el bloque en curso se descarta, para que
+           no se aprenda el gesto. */
+        if (vel == 0) {
+            suma_x += filtro2_x;
+            suma_y += filtro2_y;
+            if (++bloque >= HELM_BASE_BLOQUE) {
+                base_x = suma_x / HELM_BASE_BLOQUE;
+                base_y = suma_y / HELM_BASE_BLOQUE;
+                suma_x = suma_y = 0;
+                bloque = 0;
+            }
+        } else {
+            suma_x = suma_y = 0;
+            bloque = 0;
+        }
+
+        /* Acumular la fracción: sin esto un movimiento lento se redondearía a
+           cero en cada ciclo y el puntero no arrancaría nunca. */
+        resto_x += filtro2_x - base_x;
+        resto_y += filtro2_y - base_y;
+        const int32_t paso_x = resto_x >> HELM_FILTRO_Q;
+        const int32_t paso_y = resto_y >> HELM_FILTRO_Q;
+        resto_x -= paso_x << HELM_FILTRO_Q;
+        resto_y -= paso_y << HELM_FILTRO_Q;
+
         out_x     = pending_x;
         out_y     = pending_y;
-        pending_x = report.x;
-        pending_y = report.y;
+        pending_x = (mouse_xy_report_t)paso_x;
+        pending_y = (mouse_xy_report_t)paso_y;
     }
     report.x = out_x;
     report.y = out_y;
