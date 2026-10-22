@@ -90,8 +90,12 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
  * base layer to avoid having to layer change mid edit and to enable auto-repeat.
  */
   [LAYER_NAVIGATION] = LAYOUT_split_3x5_3(
-    XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX,
-    KC_LGUI, KC_LALT, KC_LCTL, KC_LSFT, XXXXXXX, KC_CAPS, KC_LEFT, KC_DOWN,   KC_UP, KC_RGHT,
+    /* Cruceta en I J K L: la flecha arriba sube a la I y las tres restantes
+       quedan bajo índice, corazón y anular en la fila de reposo. Antes iban las
+       cuatro en fila (←↓↑→ sobre J K L '), que obliga a traducir "arriba" a una
+       posición horizontal. La cruceta coincide con la forma del gesto. */
+    XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX, XXXXXXX,   KC_UP, XXXXXXX, XXXXXXX,
+    KC_LGUI, KC_LALT, KC_LCTL, KC_LSFT, XXXXXXX, KC_CAPS, KC_LEFT, KC_DOWN, KC_RGHT, XXXXXXX,
     XXXXXXX, KC_RALT, XXXXXXX, XXXXXXX, XXXXXXX,  KC_INS, KC_HOME, KC_PGDN, KC_PGUP,  KC_END,
                       XXXXXXX, XXXXXXX, _______,  KC_ENT, KC_BSPC, KC_DEL
   ),
@@ -111,7 +115,13 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 
 /** \brief Mouse emulation and pointer functions. */
   [LAYER_POINTER] = LAYOUT_split_3x5_3(
-    QK_BOOT,  EE_CLR, XXXXXXX, DPI_MOD, S_D_MOD, S_D_MOD, DPI_MOD, XXXXXXX,  EE_CLR, QK_BOOT,
+    /* QK_BOOT y EE_CLR SOLO en la mitad derecha. Venían duplicados en las
+       cuatro esquinas superiores, y esta capa se enciende sola al tocar el
+       trackpad (es AUTO_MOUSE_DEFAULT_LAYER): dejar el salto al bootloader y el
+       borrado de la EEPROM bajo los meñiques de las dos manos es tentar a la
+       suerte. Con una sola copia siguen estando accesibles y hay la mitad de
+       superficie por la que dispararlos sin querer. */
+    XXXXXXX, XXXXXXX, XXXXXXX, DPI_MOD, S_D_MOD, S_D_MOD, DPI_MOD, XXXXXXX,  EE_CLR, QK_BOOT,
     KC_LGUI, KC_LALT, KC_LCTL, KC_LSFT, XXXXXXX, XXXXXXX, KC_LSFT, KC_LCTL, KC_LALT, KC_LGUI,
     _______, DRGSCRL, SNIPING, MS_BTN3, XXXXXXX, XXXXXXX, MS_BTN3, SNIPING, DRGSCRL, _______,
                       MS_BTN3, MS_BTN2, MS_BTN1, MS_BTN1, MS_BTN2, MS_BTN3
